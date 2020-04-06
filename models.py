@@ -251,10 +251,10 @@ class Darknet(torch.jit.ScriptModule):
     def get_yolo_layers(self):
         layers = []
 
-    for layer in self.module_list:
-        if hasattr(layer[0], "metrics"):
-            layers.append(layer[0])
-    return layers
+        for layer in self.module_list:
+            if hasattr(layer[0], "metrics"):
+                layers.append(layer[0])
+        return layers
 
 
 @torch.jit.export
