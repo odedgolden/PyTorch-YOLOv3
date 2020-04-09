@@ -12,91 +12,6 @@ from utils.utils import build_targets, to_cpu, non_max_suppression
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
-
-def create_modules(module_defs):
-    """
-    Constructs module list of layer blocks from module configuration in module_defs
-    """
-    
-    # Popping out
-    hyperparams = module_defs.pop(0)
-    #
-    output_filters = [int(hyperparams["channels"])]
-    # The main construct that will hold the whole pipeline:
-    module_list = nn.ModuleList()
-    # Create each layer of the pipeline as an nn.Sequential() layer
-    for module_i, module_def in enumerate(module_defs):
-        modules = nn.Sequential()
-        
-        # Switch on module type: ["convolutional","maxpool","upsample","route","shortcut","yolo"]
-        
-        ############################################# Convolutional ########################################
-        if module_def["type"] == "convolutional":
-            bn = int(module_def["batch_normalize"])
-            filters = int(module_def["filters"])
-            kernel_size = int(module_def["size"])
-            pad = (kernel_size - 1) // 2
-            modules.add_module(
-                f"conv_{module_i}",
-                nn.Conv2d(
-                    in_channels=output_filters[-1],
-                    out_channels=filters,
-                    kernel_size=kernel_size,
-                    stride=int(module_def["stride"]),
-                    padding=pad,
-                    bias=not bn,
-                ),
-            )
-            if bn:
-                modules.add_module(f"batch_norm_{module_i}", nn.BatchNorm2d(filters, momentum=0.9, eps=1e-5))
-            if module_def["activation"] == "leaky":
-                modules.add_module(f"leaky_{module_i}", nn.LeakyReLU(0.1))
-        
-        ############################################# MaxPool ###############################################
-        elif module_def["type"] == "maxpool":
-            kernel_size = int(module_def["size"])
-            stride = int(module_def["stride"])
-            if kernel_size == 2 and stride == 1:
-                modules.add_module(f"_debug_padding_{module_i}", nn.ZeroPad2d((0, 1, 0, 1)))
-            maxpool = nn.MaxPool2d(kernel_size=kernel_size, stride=stride, padding=int((kernel_size - 1) // 2))
-            modules.add_module(f"maxpool_{module_i}", maxpool)
-
-            
-        ############################################# UpSample ##############################################
-        elif module_def["type"] == "upsample":
-            upsample = Upsample(scale_factor=int(module_def["stride"]), mode="nearest")
-            modules.add_module(f"upsample_{module_i}", upsample)
-        
-        ############################################# Route ##################################################
-        elif module_def["type"] == "route":
-            layers = [int(x) for x in module_def["layers"].split(",")]
-            filters = sum([output_filters[1:][i] for i in layers])
-            modules.add_module(f"route_{module_i}", EmptyLayer())
-        
-        ############################################# ShortCut ###############################################
-        elif module_def["type"] == "shortcut":
-            filters = output_filters[1:][int(module_def["from"])]
-            modules.add_module(f"shortcut_{module_i}", EmptyLayer())
-
-        ############################################# Yolo ####################################################
-        elif module_def["type"] == "yolo":
-            anchor_idxs = [int(x) for x in module_def["mask"].split(",")]
-            # Extract anchors
-            anchors = [int(x) for x in module_def["anchors"].split(",")]
-            anchors = [(anchors[i], anchors[i + 1]) for i in range(0, len(anchors), 2)]
-            anchors = [anchors[i] for i in anchor_idxs]
-            num_classes = int(module_def["classes"])
-            img_size = int(hyperparams["height"])
-            # Define detection layer
-            yolo_layer = YOLOLayer(anchors, num_classes, img_size)
-            modules.add_module(f"yolo_{module_i}", yolo_layer)
-        # Register module list and number of output filters
-        module_list.append(modules)
-        output_filters.append(filters)
-
-    return hyperparams, module_list
-
-
 class Upsample(nn.Module):
     """ nn.Upsample is deprecated """
 
@@ -250,8 +165,8 @@ class Darknet(nn.Module):
 
     def __init__(self, config_path, img_size=416):
         super(Darknet, self).__init__()
-        self.module_defs = parse_model_config(config_path)
-        self.hyperparams, self.module_list = create_modules(self.module_defs)
+        self.module_defs = self.parse_model_config(config_path)
+        self.hyperparams, self.module_list = self.create_modules(self.module_defs)
         self.yolo_layers = [layer[0] for layer in self.module_list if hasattr(layer[0], "metrics")]
         self.img_size = img_size
         self.seen = 0
@@ -276,7 +191,8 @@ class Darknet(nn.Module):
             layer_outputs.append(x)
         yolo_outputs = to_cpu(torch.cat(yolo_outputs, 1))
         return yolo_outputs if targets is None else (loss, yolo_outputs)
-
+    
+    @torch.jit.ignore
     def load_darknet_weights(self, weights_path):
         """Parses and loads the weights stored in 'weights_path'"""
 
@@ -329,7 +245,120 @@ class Darknet(nn.Module):
                 conv_w = torch.from_numpy(weights[ptr : ptr + num_w]).view_as(conv_layer.weight)
                 conv_layer.weight.data.copy_(conv_w)
                 ptr += num_w
+    
+#     @torch.jit.export
+    def parse_model_config(self, path):
+        """Parses the yolo-v3 layer configuration file and returns module definitions"""
+        file = open(path, 'r')
+        raw_lines = file.read().split('\n')
+        lines = []
+        for line in raw_lines:
+            if line and not line.startswith('#'):
+                lines.append(line.rstrip().lstrip()) # get rid of fringe whitespaces
+        module_defs = []
+        for line in lines:
+            if line.startswith('['): # This marks the start of a new block
+                module_defs.append({})
+                module_defs[-1]['type'] = line[1:-1].rstrip()
+                if module_defs[-1]['type'] == 'convolutional':
+                    module_defs[-1]['batch_normalize'] = 0
+            else:
+                key, value = line.split("=")
+                value = value.strip()
+                module_defs[-1][key.rstrip()] = value.strip()
 
+        return module_defs
+    
+#     @torch.jit.export
+    def create_modules(self, module_defs):
+        """
+        Constructs module list of layer blocks from module configuration in module_defs
+        """
+    
+        # Get the hyper parameters dict for the whole net: module_defs[0]
+        print(module_defs)
+        hyperparams = module_defs.pop(0)
+        # Get the number of input channels: (.i.e. 3 for RGB)
+        output_filters = [int(hyperparams["channels"])]
+        # The main construct that will hold the whole pipeline:
+        module_list = nn.ModuleList()
+        # Create each layer of the pipeline as an nn.Sequential() layer
+        for module_i, module_def in enumerate(module_defs):
+            modules = nn.Sequential()
+
+            # Switch on module type: ["convolutional","maxpool","upsample","route","shortcut","yolo"]
+
+            ############################################# Convolutional ########################################
+            if module_def["type"] == "convolutional":
+                # Get the hyper parameters for the current layer:
+                bn, filters, kernel_size = int(module_def["batch_normalize"]), int(module_def["filters"]), int(module_def["size"])
+                pad = (kernel_size - 1) // 2
+
+                modules.add_module(
+                    f"conv_{module_i}",
+                    nn.Conv2d(
+                        in_channels=output_filters[-1],
+                        out_channels=filters,
+                        kernel_size=kernel_size,
+                        stride=int(module_def["stride"]),
+                        padding=pad,
+                        bias=not bn,
+                    ),
+                )
+                if bn:
+                    modules.add_module(f"batch_norm_{module_i}", nn.BatchNorm2d(filters, momentum=0.9, eps=1e-5))
+                if module_def["activation"] == "leaky":
+                    modules.add_module(f"leaky_{module_i}", nn.LeakyReLU(0.1))
+
+            ############################################# MaxPool ###############################################
+            elif module_def["type"] == "maxpool":
+                # Get the hyper parameters for the current layer:
+                kernel_size, stride = int(module_def["size"]), int(module_def["stride"])
+
+                if kernel_size == 2 and stride == 1:
+                    modules.add_module(f"_debug_padding_{module_i}", nn.ZeroPad2d((0, 1, 0, 1)))
+                maxpool = nn.MaxPool2d(kernel_size=kernel_size, stride=stride, padding=int((kernel_size - 1) // 2))
+                modules.add_module(f"maxpool_{module_i}", maxpool)
+
+
+            ############################################# UpSample ##############################################
+            elif module_def["type"] == "upsample":
+                upsample = Upsample(scale_factor=int(module_def["stride"]), mode="nearest")
+                modules.add_module(f"upsample_{module_i}", upsample)
+
+            ############################################# Route ##################################################
+            elif module_def["type"] == "route":
+                layers = [int(x) for x in module_def["layers"].split(",")]
+                filters = sum([output_filters[1:][i] for i in layers])
+                modules.add_module(f"route_{module_i}", EmptyLayer())
+
+            ############################################# ShortCut ###############################################
+            elif module_def["type"] == "shortcut":
+                filters = output_filters[1:][int(module_def["from"])]
+                modules.add_module(f"shortcut_{module_i}", EmptyLayer())
+
+            ############################################# Yolo ####################################################
+            elif module_def["type"] == "yolo":
+                anchor_idxs = [int(x) for x in module_def["mask"].split(",")]
+
+                # Extract anchors
+                anchors = [int(x) for x in module_def["anchors"].split(",")]
+                anchors = [(anchors[i], anchors[i + 1]) for i in range(0, len(anchors), 2)]
+                anchors = [anchors[i] for i in anchor_idxs]
+                num_classes = int(module_def["classes"])
+                img_size = int(hyperparams["height"])
+
+                # Define detection layer
+                yolo_layer = YOLOLayer(anchors, num_classes, img_size)
+                modules.add_module(f"yolo_{module_i}", yolo_layer)
+
+            # Register module list and number of output filters
+            module_list.append(modules)
+            output_filters.append(filters)
+
+        return hyperparams, module_list
+    
+#     @torch.jit.export
     def save_darknet_weights(self, path, cutoff=-1):
         """
             @:param path    - path of the new weights file
@@ -357,3 +386,4 @@ class Darknet(nn.Module):
                 conv_layer.weight.data.cpu().numpy().tofile(fp)
 
         fp.close()
+
